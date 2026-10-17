@@ -1,19 +1,95 @@
-import os, uuid, json, time, asyncio, threading
+# =====================================================================
+# app.py — ZALO MULTI-INSTANCE QR LOGIN (SINGLE FILE)
+# Chạy: gunicorn app:app --bind 0.0.0.0:$PORT
+# =====================================================================
+import os
+import uuid
+import json
+import time
+import threading
+import requests
+import qrcode
 from io import BytesIO
 from flask import Flask, jsonify, request, send_file, Response, abort
-
-try:
-    from zalo_login import login_qr_with_unique_imei, LoginQRCallbackEventType
-    ZALO_OK = True
-    ZALO_ERR = ""
-except Exception as e:
-    ZALO_OK = False
-    ZALO_ERR = str(e)
 
 app = Flask(__name__)
 instances = {}
 lock = threading.Lock()
 
+# ==================== CORE ZALO QR LOGIC =======================
+def login_qr_sync(callback):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://id.zalo.me",
+        "Referer": "https://id.zalo.me/account/login",
+    }
+    session = requests.Session()
+    try:
+        resp = session.get("https://id.zalo.me/account/login/qr", headers=headers, timeout=10)
+        data = resp.json()
+        qr_data = data.get("data", {})
+        qr_code = qr_data.get("qrCode") or qr_data.get("qr")
+        qr_url = qr_data.get("qrUrl")
+    except Exception as e:
+        callback({"type": "error", "data": {"message": f"Lỗi kết nối Zalo: {str(e)}"}})
+        return None
+
+    if not qr_code and not qr_url:
+        callback({"type": "error", "data": {"message": "Zalo từ chối cấp mã QR."}})
+        return None
+
+    qr_bytes = None
+    if qr_url:
+        try:
+            qr_resp = session.get(qr_url, headers=headers, timeout=10)
+            qr_bytes = qr_resp.content
+        except:
+            pass
+    
+    if not qr_bytes and qr_code:
+        img = qrcode.make(qr_code)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        qr_bytes = buf.getvalue()
+
+    callback({
+        "type": "QRCodeGenerated",
+        "data": {"qrCode": qr_code},
+        "actions": {"saveToFile": lambda path: open(path, "wb").write(qr_bytes)}
+    })
+
+    for _ in range(60): # 120 giây
+        time.sleep(2)
+        try:
+            check_resp = session.get(f"https://id.zalo.me/account/login/qr/check?qrCode={qr_code}", headers=headers, timeout=10)
+            check_data = check_resp.json()
+        except:
+            continue
+        
+        status = check_data.get("data", {}).get("status")
+        if status == "scanned":
+            callback({
+                "type": "QRCodeScanned",
+                "data": {"display_name": check_data.get("data", {}).get("displayName", "Người dùng")}
+            })
+        elif status == "confirmed":
+            cookies = session.cookies.get_dict()
+            imei = check_data.get("data", {}).get("imei", "")
+            user_info = check_data.get("data", {}).get("userInfo", {})
+            callback({"type": "GotLoginInfo", "data": {}})
+            return {
+                "cookies": cookies,
+                "imei": imei,
+                "user_info": user_info
+            }
+        elif status == "expired":
+            callback({"type": "QRCodeExpired"})
+            return None
+    
+    return None
+
+# ==================== THREAD WORKER ============================
 def worker(instance_id):
     inst = instances[instance_id]
     
@@ -22,7 +98,7 @@ def worker(instance_id):
         data = event.get("data", {})
         actions = event.get("actions", {})
         
-        if et == LoginQRCallbackEventType.QRCodeGenerated:
+        if et == "QRCodeGenerated":
             actions["saveToFile"](f"qr_{instance_id}.png")
             with open(f"qr_{instance_id}.png", "rb") as f:
                 inst["qr_bytes"] = f.read()
@@ -30,17 +106,17 @@ def worker(instance_id):
             inst["status"] = "qr_ready"
             inst["message"] = "Quét QR bằng ứng dụng Zalo."
             
-        elif et == LoginQRCallbackEventType.QRCodeScanned:
+        elif et == "QRCodeScanned":
             inst["status"] = "scanned"
             inst["message"] = f"Đã quét bởi {data.get('display_name', 'Ai đó')}. Xác nhận trên đt."
             inst["qr_bytes"] = None
             
-        elif et == LoginQRCallbackEventType.QRCodeExpired:
+        elif et == "QRCodeExpired":
             inst["status"] = "expired"
             inst["message"] = "QR hết hạn."
             inst["qr_bytes"] = None
             
-        elif et == LoginQRCallbackEventType.GotLoginInfo:
+        elif et == "GotLoginInfo":
             inst["status"] = "processing"
             inst["message"] = "Đang lấy dữ liệu..."
             
@@ -50,31 +126,25 @@ def worker(instance_id):
             inst["qr_bytes"] = None
 
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(asyncio.wait_for(login_qr_with_unique_imei(callback), timeout=180))
-        loop.close()
-        
+        result = login_qr_sync(callback)
         if result:
             inst["result"] = result
             inst["status"] = "success"
             inst["message"] = "Đăng nhập thành công."
         else:
-            inst["status"] = "error"
-            inst["message"] = "Không lấy được thông tin."
-    except asyncio.TimeoutError:
-        inst["status"] = "expired"
-        inst["message"] = "Hết thời gian chờ."
+            if inst["status"] not in ["expired", "error"]:
+                inst["status"] = "error"
+                inst["message"] = "Không lấy được thông tin hoặc hết hạn."
     except Exception as e:
         inst["status"] = "error"
         inst["message"] = str(e)
     finally:
         inst["qr_bytes"] = None
 
+# ==================== ROUTES ===================================
 @app.route("/")
 def index():
-    return Response(HTML_PAGE.replace("__ZALO_OK__", "1" if ZALO_OK else "0")
-                             .replace("__ZALO_ERR__", ZALO_ERR), mimetype="text/html")
+    return Response(HTML_PAGE, mimetype="text/html")
 
 @app.route("/api/instances", methods=["GET"])
 def get_instances():
@@ -92,8 +162,6 @@ def get_instances():
 
 @app.route("/api/instance", methods=["POST"])
 def create_instance():
-    if not ZALO_OK:
-        return jsonify({"error": f"Module zalo_login lỗi: {ZALO_ERR}"}), 500
     iid = str(uuid.uuid4())
     with lock:
         instances[iid] = {
@@ -115,8 +183,9 @@ def get_qr(iid):
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "zalo": ZALO_OK})
+    return jsonify({"ok": True})
 
+# ==================== FRONTEND HTML ============================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -131,7 +200,7 @@ h1{text-align:center;margin-bottom:20px;color:#60a5fa}
 .btn{background:#2563eb;color:#fff;border:none;padding:12px 24px;border-radius:8px;cursor:pointer;font-weight:bold;margin-bottom:20px;display:block;margin:0 auto 20px auto;font-size:16px;transition:.2s}
 .btn:hover{background:#1d4ed8}
 .grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));gap:20px}
-.card{background:#1e293b;padding:20px;border-radius:12px;box-shadow:0 4px 10px rgba(0,0,0,.3);text-align:center;border:2px solid transparent}
+.card{background:#1e293b;padding:20px;border-radius:12px;box-shadow:0 4px 10px rgba(0,0,0,.3);text-align:center;border:2px solid transparent;position:relative}
 .card.success{border-color:#22c55e}
 .card.error{border-color:#ef4444}
 .card h3{margin-bottom:10px;font-size:16px;color:#f8fafc}
@@ -139,27 +208,16 @@ h1{text-align:center;margin-bottom:20px;color:#60a5fa}
 .qr{width:100%;max-width:200px;border-radius:8px;margin:0 auto;display:block;background:#fff;padding:10px}
 pre{background:#0f172a;padding:10px;border-radius:6px;font-size:11px;text-align:left;overflow-x:auto;max-height:150px;white-space:pre-wrap;word-break:break-all;margin-top:10px}
 .data-text{text-align:left;font-size:13px;margin-top:10px;line-height:1.5}
-.hidden{display:none}
-.alert{color:#fca5a5;text-align:center;margin-bottom:20px;background:#7f1d1d;padding:12px;border-radius:8px}
 </style>
 </head>
 <body>
 <div class="box">
   <h1>💻 Zalo QR Instances</h1>
-  <div id="warn" class="alert hidden"></div>
   <button class="btn" onclick="addInstance()">+ Tạo Máy Tính Mới</button>
   <div id="grid" class="grid"></div>
 </div>
 <script>
-const ZALO_OK = __ZALO_OK__ === 1;
-const ZALO_ERR = "__ZALO_ERR__";
-if(!ZALO_OK){
-    document.getElementById('warn').classList.remove('hidden');
-    document.getElementById('warn').textContent = "Lỗi module Zalo: " + ZALO_ERR;
-}
-
 async function addInstance() {
-    if(!ZALO_OK) return;
     try {
         const res = await fetch('/api/instance', {method:'POST'});
         if(!res.ok) throw new Error("Không thể tạo máy tính mới");
@@ -203,10 +261,8 @@ async function poll() {
     } catch(e) { console.error("Poll error", e); }
 }
 
-if(ZALO_OK) {
-    poll();
-    setInterval(poll, 2000);
-}
+poll();
+setInterval(poll, 2000);
 </script>
 </body>
 </html>"""
