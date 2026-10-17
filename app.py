@@ -1,6 +1,6 @@
 # =====================================================================
-# app.py — ZALO MULTI-INSTANCE QR LOGIN (FIXED UI & API)
-# Lệnh chạy: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+# app.py — ZALO MULTI-INSTANCE QR LOGIN (CUSTOM RENDER)
+# Chạy: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
 # =====================================================================
 import os
 import uuid
@@ -16,7 +16,23 @@ app = Flask(__name__)
 instances = {}
 lock = threading.Lock()
 
-# ==================== CORE ZALO QR LOGIC (SYNC) =======================
+# ==================== CORE ZALO QR LOGIC =======================
+def generate_qr_image(qr_code):
+    """Tự vẽ ảnh QR từ chuỗi code với màu xanh đen chuẩn Zalo"""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(qr_code)
+    qr.make(fit=True)
+    # Tạo ảnh với màu chủ đạo (xanh đậm) và nền trắng
+    img = qr.make_image(fill_color="#0055ff", back_color="white")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
 def login_qr_sync(callback):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -29,13 +45,13 @@ def login_qr_sync(callback):
     }
     session = requests.Session()
 
-    # Bước 1: Lấy cookie khởi tạo (z_uuid)
+    # Lấy cookie mồi
     try:
         session.get("https://id.zalo.me/account/login", headers=headers, timeout=10)
     except:
         pass
 
-    # Bước 2: Gọi API tạo QR
+    # Gọi API xin mã QR
     try:
         resp = session.post("https://id.zalo.me/account/authen/qr/generate", 
                             headers=headers, 
@@ -46,24 +62,20 @@ def login_qr_sync(callback):
         
         qr_data = data.get("data", {})
         qr_code = qr_data.get("code")
-        qr_image_base64 = qr_data.get("image")
     except Exception as e:
         callback({"type": "error", "data": {"message": f"Zalo chặn kết nối: {str(e)}"}})
         return None
 
-    if not qr_code and not qr_image_base64:
+    if not qr_code:
         callback({"type": "error", "data": {"message": "Zalo từ chối cấp mã QR (Không có data)."}})
         return None
 
-    # Bước 3: Tạo ảnh QR
-    if qr_image_base64:
-        import base64
-        qr_bytes = base64.b64decode(qr_image_base64)
-    else:
-        img = qrcode.make(qr_code)
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        qr_bytes = buf.getvalue()
+    # TỰ VẼ QR BẰNG PYTHON (Không dùng ảnh base64 của Zalo)
+    try:
+        qr_bytes = generate_qr_image(qr_code)
+    except Exception as e:
+        callback({"type": "error", "data": {"message": f"Lỗi vẽ ảnh QR: {str(e)}"}})
+        return None
 
     callback({
         "type": "QRCodeGenerated",
@@ -71,7 +83,7 @@ def login_qr_sync(callback):
         "actions": {"saveToFile": lambda path: open(path, "wb").write(qr_bytes)}
     })
 
-    # Bước 4: Polling trạng thái quét
+    # Vòng lặp chờ quét
     for _ in range(60):  # 120 giây
         time.sleep(2)
         try:
@@ -96,9 +108,8 @@ def login_qr_sync(callback):
 
         error_code = check_data.get("error_code")
         
-        if error_code == 0:  # Đăng nhập thành công
+        if error_code == 0:  # Thành công
             try:
-                # Lấy thêm cookie cuối
                 session.get("https://id.zalo.me/account/checksession?continue=https%3A%2F%2Fchat.zalo.me%2F", 
                             headers=headers, timeout=10)
                 
@@ -116,15 +127,15 @@ def login_qr_sync(callback):
                 callback({"type": "error", "data": {"message": f"Lỗi lấy cookie: {str(e)}"}})
                 return None
                 
-        elif error_code == 200:  # Đang chờ quét
+        elif error_code == 200:  # Đang chờ
             continue
-        elif error_code == 201:  # Đã quét, chờ xác nhận
+        elif error_code == 201:  # Đã quét
             display_name = check_data.get("data", {}).get("display_name", "Người dùng")
             callback({
                 "type": "QRCodeScanned",
                 "data": {"display_name": display_name}
             })
-        elif error_code in [202, 203]:  # Hết hạn hoặc bị từ chối
+        elif error_code in [202, 203]:  # Hết hạn
             callback({"type": "QRCodeExpired"})
             return None
 
@@ -150,7 +161,7 @@ def worker(instance_id):
             
         elif et == "QRCodeScanned":
             inst["status"] = "scanned"
-            inst["message"] = f"Đã quét bởi {data.get('display_name', 'Ai đó')}."
+            inst["message"] = f"Đã quét bởi {data.get('display_name', 'Ai đó')}. Xác nhận trên đt."
             inst["qr_bytes"] = None
             
         elif et == "QRCodeExpired":
@@ -248,7 +259,7 @@ h1{text-align:center;margin-bottom:20px;color:#60a5fa}
 .card.error{border-color:#ef4444}
 .card h3{margin-bottom:10px;font-size:16px;color:#f8fafc}
 .card p{font-size:13px;color:#94a3b8;margin-bottom:12px;min-height:36px}
-.qr{width:100%;max-width:200px;border-radius:8px;margin:0 auto;display:block;background:#fff;padding:10px}
+.qr{width:100%;max-width:220px;border-radius:8px;margin:0 auto;display:block;background:#fff;padding:10px}
 pre{background:#0f172a;padding:10px;border-radius:6px;font-size:11px;text-align:left;overflow-x:auto;max-height:150px;white-space:pre-wrap;word-break:break-all;margin-top:10px}
 .data-text{text-align:left;font-size:13px;margin-top:10px;line-height:1.5}
 </style>
@@ -269,7 +280,7 @@ async function addInstance() {
         const res = await fetch('/api/instance', {method:'POST'});
         const data = await res.json();
         if(!res.ok) throw new Error(data.error || "Lỗi máy chủ");
-        await poll(); // Cập nhật giao diện ngay lập tức
+        await poll();
     } catch(e) {
         alert("Lỗi: " + e.message);
     } finally {
@@ -284,7 +295,6 @@ async function poll() {
         const list = await res.json();
         const grid = document.getElementById('grid');
         
-        // Chỉ render lại khi có thay đổi (tránh nháy ảnh)
         if(grid.children.length !== list.length) {
             grid.innerHTML = '';
         }
@@ -318,7 +328,6 @@ async function poll() {
                          </div>`;
             }
             
-            // Chỉ cập nhật innerHTML nếu có sự thay đổi để tránh load lại ảnh QR liên tục
             if(div.innerHTML !== html) {
                 div.innerHTML = html;
             }
