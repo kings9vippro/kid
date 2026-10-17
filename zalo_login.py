@@ -1,5 +1,5 @@
-import aiohttp
 import asyncio
+import aiohttp
 import qrcode
 from io import BytesIO
 
@@ -10,7 +10,7 @@ class LoginQRCallbackEventType:
     QRCodeDeclined  = "QRCodeDeclined"
     GotLoginInfo    = "GotLoginInfo"
 
-async def login_qr_with_unique_imei(callback=None):
+async def _async_login_qr(callback=None):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -91,3 +91,13 @@ async def login_qr_with_unique_imei(callback=None):
                 return None
         
         return None
+
+# Hàm wrapper đồng bộ để Flask có thể gọi
+def login_qr_with_unique_imei(callback=None):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(_async_login_qr(callback))
