@@ -1,6 +1,5 @@
 # =====================================================================
-# app.py — ZALO MULTI-INSTANCE QR LOGIN (CUSTOM RENDER)
-# Chạy: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+# app.py — ZALO MULTI-INSTANCE QR LOGIN (FIXED BASE64 & CUSTOM RENDER)
 # =====================================================================
 import os
 import uuid
@@ -8,6 +7,7 @@ import time
 import threading
 import requests
 import qrcode
+import base64
 from io import BytesIO
 from urllib.parse import urlencode
 from flask import Flask, jsonify, request, send_file, Response, abort
@@ -17,22 +17,6 @@ instances = {}
 lock = threading.Lock()
 
 # ==================== CORE ZALO QR LOGIC =======================
-def generate_qr_image(qr_code):
-    """Tự vẽ ảnh QR từ chuỗi code với màu xanh đen chuẩn Zalo"""
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(qr_code)
-    qr.make(fit=True)
-    # Tạo ảnh với màu chủ đạo (xanh đậm) và nền trắng
-    img = qr.make_image(fill_color="#0055ff", back_color="white")
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
 def login_qr_sync(callback):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -45,13 +29,13 @@ def login_qr_sync(callback):
     }
     session = requests.Session()
 
-    # Lấy cookie mồi
+    # Bước 1: Lấy cookie mồi
     try:
         session.get("https://id.zalo.me/account/login", headers=headers, timeout=10)
     except:
         pass
 
-    # Gọi API xin mã QR
+    # Bước 2: Gọi API xin mã QR
     try:
         resp = session.post("https://id.zalo.me/account/authen/qr/generate", 
                             headers=headers, 
@@ -62,19 +46,45 @@ def login_qr_sync(callback):
         
         qr_data = data.get("data", {})
         qr_code = qr_data.get("code")
+        qr_image_base64 = qr_data.get("image")
     except Exception as e:
         callback({"type": "error", "data": {"message": f"Zalo chặn kết nối: {str(e)}"}})
         return None
 
-    if not qr_code:
-        callback({"type": "error", "data": {"message": "Zalo từ chối cấp mã QR (Không có data)."}})
+    if not qr_code and not qr_image_base64:
+        callback({"type": "error", "data": {"message": "Zalo từ chối cấp mã QR."}})
         return None
 
-    # TỰ VẼ QR BẰNG PYTHON (Không dùng ảnh base64 của Zalo)
-    try:
-        qr_bytes = generate_qr_image(qr_code)
-    except Exception as e:
-        callback({"type": "error", "data": {"message": f"Lỗi vẽ ảnh QR: {str(e)}"}})
+    qr_bytes = None
+
+    # Bước 3: Xử lý ảnh QR (Ưu tiên lấy ảnh chuẩn từ Zalo)
+    if qr_image_base64:
+        try:
+            # Sửa lỗi base64 của Zalo: cắt bỏ tiền tố, thêm padding '=' nếu thiếu
+            if "," in qr_image_base64:
+                qr_image_base64 = qr_image_base64.split(",")[1]
+            qr_image_base64 += "=" * ((4 - len(qr_image_base64) % 4) % 4)
+            qr_bytes = base64.b64decode(qr_image_base64)
+        except Exception:
+            qr_bytes = None # Nếu lỗi base64, chuyển sang tự vẽ
+
+    # Nếu Zalo không trả ảnh hoặc ảnh lỗi, tự vẽ từ code
+    if not qr_bytes and qr_code:
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(qr_code)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="#0055ff", back_color="white")
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        qr_bytes = buf.getvalue()
+
+    if not qr_bytes:
+        callback({"type": "error", "data": {"message": "Không thể tạo ảnh QR."}})
         return None
 
     callback({
@@ -83,8 +93,8 @@ def login_qr_sync(callback):
         "actions": {"saveToFile": lambda path: open(path, "wb").write(qr_bytes)}
     })
 
-    # Vòng lặp chờ quét
-    for _ in range(60):  # 120 giây
+    # Bước 4: Polling trạng thái quét (Lấy Cookie/IMEI)
+    for _ in range(60):
         time.sleep(2)
         try:
             poll_headers = headers.copy()
@@ -108,7 +118,7 @@ def login_qr_sync(callback):
 
         error_code = check_data.get("error_code")
         
-        if error_code == 0:  # Thành công
+        if error_code == 0:  # Đăng nhập thành công
             try:
                 session.get("https://id.zalo.me/account/checksession?continue=https%3A%2F%2Fchat.zalo.me%2F", 
                             headers=headers, timeout=10)
@@ -127,15 +137,15 @@ def login_qr_sync(callback):
                 callback({"type": "error", "data": {"message": f"Lỗi lấy cookie: {str(e)}"}})
                 return None
                 
-        elif error_code == 200:  # Đang chờ
+        elif error_code == 200:  # Đang chờ quét
             continue
-        elif error_code == 201:  # Đã quét
+        elif error_code == 201:  # Đã quét, chờ xác nhận trên điện thoại
             display_name = check_data.get("data", {}).get("display_name", "Người dùng")
             callback({
                 "type": "QRCodeScanned",
                 "data": {"display_name": display_name}
             })
-        elif error_code in [202, 203]:  # Hết hạn
+        elif error_code in [202, 203]:  # Hết hạn hoặc bị hủy
             callback({"type": "QRCodeExpired"})
             return None
 
