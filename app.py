@@ -1,53 +1,56 @@
 # =====================================================================
-# app.py — ZALO MULTI-INSTANCE QR LOGIN (SINGLE FILE)
+# app.py — ZALO MULTI-INSTANCE QR LOGIN (CẬP NHẬT API MỚI)
 # Chạy: gunicorn app:app --bind 0.0.0.0:$PORT
 # =====================================================================
 import os
 import uuid
-import json
 import time
 import threading
 import requests
 import qrcode
 from io import BytesIO
+from urllib.parse import urlencode
 from flask import Flask, jsonify, request, send_file, Response, abort
 
 app = Flask(__name__)
 instances = {}
 lock = threading.Lock()
 
-# ==================== CORE ZALO QR LOGIC =======================
+# ==================== CORE ZALO QR LOGIC (SYNC) =======================
 def login_qr_sync(callback):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://id.zalo.me",
         "Referer": "https://id.zalo.me/account/login",
     }
     session = requests.Session()
+
+    # 1. Gọi API tạo QR mới (POST form-urlencoded)
     try:
-        resp = session.get("https://id.zalo.me/account/login/qr", headers=headers, timeout=10)
+        resp = session.post("https://id.zalo.me/account/authen/qr/generate", 
+                            headers=headers, data="continue=https%3A%2F%2Fchat.zalo.me%2F", timeout=10)
+        resp.raise_for_status()
         data = resp.json()
+        
+        # Trích xuất mã QR từ response
         qr_data = data.get("data", {})
-        qr_code = qr_data.get("qrCode") or qr_data.get("qr")
-        qr_url = qr_data.get("qrUrl")
+        qr_code = qr_data.get("code") or qr_data.get("qrCode")
+        qr_image_base64 = qr_data.get("image")  # Zalo có thể trả về ảnh base64
     except Exception as e:
-        callback({"type": "error", "data": {"message": f"Lỗi kết nối Zalo: {str(e)}"}})
+        callback({"type": "error", "data": {"message": f"Lỗi gọi API Zalo: {str(e)}"}})
         return None
 
-    if not qr_code and not qr_url:
-        callback({"type": "error", "data": {"message": "Zalo từ chối cấp mã QR."}})
+    if not qr_code and not qr_image_base64:
+        callback({"type": "error", "data": {"message": "Zalo không trả về mã QR."}})
         return None
 
-    qr_bytes = None
-    if qr_url:
-        try:
-            qr_resp = session.get(qr_url, headers=headers, timeout=10)
-            qr_bytes = qr_resp.content
-        except:
-            pass
-    
-    if not qr_bytes and qr_code:
+    # 2. Tạo ảnh QR
+    if qr_image_base64:
+        import base64
+        qr_bytes = base64.b64decode(qr_image_base64)
+    else:
         img = qrcode.make(qr_code)
         buf = BytesIO()
         img.save(buf, format="PNG")
@@ -59,34 +62,71 @@ def login_qr_sync(callback):
         "actions": {"saveToFile": lambda path: open(path, "wb").write(qr_bytes)}
     })
 
-    for _ in range(60): # 120 giây
+    # 3. Polling trạng thái quét (POST form-urlencoded)
+    for _ in range(60):  # 120 giây
         time.sleep(2)
         try:
-            check_resp = session.get(f"https://id.zalo.me/account/login/qr/check?qrCode={qr_code}", headers=headers, timeout=10)
+            poll_headers = headers.copy()
+            poll_headers["Referer"] = "https://chat.zalo.me/"
+            
+            form_data = {
+                "code": qr_code,
+                "gToken": "",
+                "gAction": "CONFIRM_QR",
+                "continue": "https://chat.zalo.me/",
+                "v": ""  # Có thể cần bundle version, nhưng thường để trống vẫn hoạt động
+            }
+            
+            check_resp = session.post("https://id.zalo.me/account/authen/qr/waiting-confirm", 
+                                      headers=poll_headers, 
+                                      data=urlencode(form_data), 
+                                      timeout=10)
             check_data = check_resp.json()
         except:
             continue
+
+        # Phân tích trạng thái
+        error_code = check_data.get("error_code")
+        error_msg = check_data.get("error_message", "")
         
-        status = check_data.get("data", {}).get("status")
-        if status == "scanned":
+        if error_code == 0:  # Thành công
+            # Lấy thông tin tài khoản
+            try:
+                # Gọi checksession để lấy cookie cuối cùng
+                session.get("https://id.zalo.me/account/checksession?continue=https%3A%2F%2Fchat.zalo.me%2F", 
+                            headers=headers, timeout=10)
+                
+                cookies = session.cookies.get_dict()
+                user_info = check_data.get("data", {}).get("account", {})
+                imei = user_info.get("imei", "")
+                
+                callback({"type": "GotLoginInfo", "data": {}})
+                return {
+                    "cookies": cookies,
+                    "imei": imei,
+                    "user_info": user_info
+                }
+            except Exception as e:
+                callback({"type": "error", "data": {"message": f"Lỗi lấy cookie: {str(e)}"}})
+                return None
+                
+        elif error_code == 200:  # Đang chờ quét
+            continue
+        elif error_code == 201:  # Đã quét, chờ xác nhận
+            display_name = check_data.get("data", {}).get("display_name", "Người dùng")
             callback({
                 "type": "QRCodeScanned",
-                "data": {"display_name": check_data.get("data", {}).get("displayName", "Người dùng")}
+                "data": {"display_name": display_name}
             })
-        elif status == "confirmed":
-            cookies = session.cookies.get_dict()
-            imei = check_data.get("data", {}).get("imei", "")
-            user_info = check_data.get("data", {}).get("userInfo", {})
-            callback({"type": "GotLoginInfo", "data": {}})
-            return {
-                "cookies": cookies,
-                "imei": imei,
-                "user_info": user_info
-            }
-        elif status == "expired":
+        elif error_code in [202, 203]:  # Hết hạn hoặc bị từ chối
             callback({"type": "QRCodeExpired"})
             return None
-    
+        else:
+            # Các lỗi khác
+            callback({"type": "error", "data": {"message": f"Zalo trả về lỗi: {error_code} - {error_msg}"}})
+            return None
+
+    callback({"type": "QRCodeExpired"})
     return None
 
 # ==================== THREAD WORKER ============================
@@ -232,9 +272,9 @@ async function poll() {
         const grid = document.getElementById('grid');
         grid.innerHTML = '';
         
-        list.forEach(inst => {
+        list.forEach(instử => {
             const div = document.createElement('div');
-            div.className = `card ${inst.status === 'success' ? 'success' : ''} ${inst.status === 'error' ? 'error' : ''}`;
+            div.className = dụng `card ${inst.status === 'success endpoint' ? 'success' : ''} ${inst.status === 'error' ? 'error' : ''}`;
             
             let html = `<h3>Máy tính ${inst.id.slice(0,4)}</h3>`;
             html += `<p>${inst.message}</p>`;
