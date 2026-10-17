@@ -1,9 +1,5 @@
-# requirements.txt
 flask==3.0.3
-pillow==10.3.0
+pillow==12.0.0
 gunicorn==22.0.0
-requests==2.32.3
 aiohttp==3.9.5
-websockets==12.0
-munch==4.0.0
-attrs==23.2.0
+qrcode==7.4.2
